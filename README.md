@@ -1,50 +1,69 @@
-# Welcome to your Expo app 👋
+# Dink Shuffle
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+A web app for organizing pickleball mixer games. Create sessions, shuffle players into teams, track scores, and view results.
 
-## Get started
+## Features
 
-1. Install dependencies
+- **Session Management** - Create named sessions with unique 5-digit codes
+- **Player Roster** - Add players with gender for mixed doubles pairing
+- **Game Modes** - Singles, Doubles (Random), and Mixed Doubles
+- **Smart Shuffle** - Generates rounds minimizing repeat partners/opponents
+- **Score Tracking** - Enter scores per court with automatic win/loss calculation
+- **Results & Rankings** - View standings by win rate or total points with medal awards
+- **Session Persistence** - Sessions saved for 24 hours with auto-restore
+- **Organizer History** - Return to previous sessions via saved session list
 
-   ```bash
-   npm install
-   ```
+## Tech Stack
 
-2. Start the app
+- **React 19** with hooks
+- **React Native Web** for cross-platform components
+- **Vite** for fast development and builds
+- **localStorage** for client-side persistence
 
-   ```bash
-   npx expo start
-   ```
-
-In the output, you'll find options to open the app in a
-
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
-
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
+## Local Development
 
 ```bash
-npm run reset-project
+# Install dependencies
+npm install
+
+# Start development server
+npm run dev
+
+# Build for production
+npm run build
+
+# Preview production build
+npm run preview
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+## Deployment
 
-## Learn more
+This app is configured for Vercel deployment:
 
-To learn more about developing your project with Expo, look at the following resources:
+1. Push to GitHub
+2. Import repository in Vercel
+3. Vercel auto-detects Vite and configures:
+   - Build Command: `npm run build`
+   - Output Directory: `dist`
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+## Project Structure
 
-## Join the community
+```
+src/
+├── components/
+│   ├── ResultsModal.jsx    # Rankings with medals
+│   └── ScoreEntry.jsx      # Score input modal
+├── screens/
+│   ├── LandingScreen.jsx   # Home/Join screen
+│   └── OrganizerScreen.jsx # Game management
+├── utils/
+│   ├── shuffle.js          # Player shuffling algorithm
+│   ├── responsive.js       # Responsive design utilities
+│   └── storage.js          # localStorage persistence
+├── App.jsx                 # Main app with routing
+└── main.jsx                # Entry point
+```
 
-Join our community of developers creating universal apps.
+## License
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+MIT
