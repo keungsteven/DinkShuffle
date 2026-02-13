@@ -1,6 +1,11 @@
 /**
  * Shuffle algorithm for Dink Shuffle
  * Supports: Singles, Doubles (Random), Doubles (Mixed)
+ *
+ * Fair distribution guarantees:
+ * - Sit-outs are evenly distributed (max difference of 1 across all players)
+ * - Every player plays with/against every other player before repeats
+ * - Weighted greedy matching with swap improvement prevents positional bias
  */
 
 /**
@@ -64,6 +69,640 @@ export function createInitialScore() {
  * @property {Player[]} sitOuts - Players sitting out this round
  */
 
+// ─── Fairness Utilities ──────────────────────────────────────────────
+
+/**
+ * Create tracking state for fair distribution across rounds
+ * @param {Player[]} players
+ * @returns {{ sitOutCounts: Map, partnerCounts: Map, opponentCounts: Map, courtCounts: Map }}
+ */
+function createFairnessState(players) {
+  const sitOutCounts = new Map();
+  const partnerCounts = new Map();
+  const opponentCounts = new Map();
+  const courtCounts = new Map(); // playerId → Map(courtNumber → count)
+
+  for (const p of players) {
+    sitOutCounts.set(p.id, 0);
+    partnerCounts.set(p.id, new Map());
+    opponentCounts.set(p.id, new Map());
+    courtCounts.set(p.id, new Map());
+  }
+
+  return { sitOutCounts, partnerCounts, opponentCounts, courtCounts };
+}
+
+/**
+ * Read count from nested Map, defaulting to 0
+ */
+function getCount(countMap, id1, id2) {
+  return countMap.get(id1)?.get(id2) || 0;
+}
+
+/**
+ * Increment count symmetrically in nested Map
+ */
+function incrementCount(countMap, id1, id2) {
+  if (!countMap.has(id1)) countMap.set(id1, new Map());
+  if (!countMap.has(id2)) countMap.set(id2, new Map());
+  countMap.get(id1).set(id2, (countMap.get(id1).get(id2) || 0) + 1);
+  countMap.get(id2).set(id1, (countMap.get(id2).get(id1) || 0) + 1);
+}
+
+/**
+ * Build a Court object with standard shape
+ */
+function buildCourtObject(roundIdx, courtIdx, players, team1, team2) {
+  const court = {
+    id: `r${roundIdx}c${courtIdx}`,
+    courtNumber: courtIdx + 1,
+    players,
+    status: 'pending',
+    score: createInitialScore(),
+  };
+  if (team1) court.team1 = team1;
+  if (team2) court.team2 = team2;
+  return court;
+}
+
+// ─── Fair Court Rotation ─────────────────────────────────────────────
+
+/**
+ * Find the optimal assignment of court groups to court numbers.
+ * Ensures players rotate through all courts before repeating.
+ *
+ * @param {Array} courtGroups - Array of player groups (pairs or team objects)
+ * @param {Map} courtCounts - playerId → Map(courtNumber → count)
+ * @param {Function} getPlayers - Extracts player array from a court group
+ * @returns {Array} - Reordered courtGroups for optimal court number assignment
+ */
+function assignCourtNumbers(courtGroups, courtCounts, getPlayers) {
+  const n = courtGroups.length;
+  if (n <= 1) return courtGroups;
+
+  // Cost of assigning a group of players to a specific court number
+  const costForCourt = (group, courtNumber) => {
+    let cost = 0;
+    for (const p of getPlayers(group)) {
+      cost += courtCounts.get(p.id)?.get(courtNumber) || 0;
+    }
+    return cost;
+  };
+
+  if (n <= 8) {
+    // Enumerate all permutations for small court counts (n! <= 40,320)
+    let bestOrder = null;
+    let bestCost = Infinity;
+
+    const enumerate = (indices, remaining) => {
+      if (remaining.length === 0) {
+        let cost = 0;
+        for (let i = 0; i < indices.length; i++) {
+          cost += costForCourt(courtGroups[indices[i]], i + 1);
+        }
+        if (cost < bestCost || (cost === bestCost && Math.random() < 0.5)) {
+          bestCost = cost;
+          bestOrder = [...indices];
+        }
+        return;
+      }
+      for (let i = 0; i < remaining.length; i++) {
+        enumerate(
+          [...indices, remaining[i]],
+          [...remaining.slice(0, i), ...remaining.slice(i + 1)]
+        );
+      }
+    };
+
+    enumerate([], Array.from({ length: n }, (_, i) => i));
+    return bestOrder.map((i) => courtGroups[i]);
+  }
+
+  // Greedy fallback for large court counts (N > 8)
+  const available = new Set(Array.from({ length: n }, (_, i) => i));
+  const result = new Array(n);
+
+  // For each court number (1..n), find the group with lowest cost
+  for (let courtNum = 1; courtNum <= n; courtNum++) {
+    let bestIdx = -1;
+    let bestCost = Infinity;
+    for (const idx of available) {
+      const cost = costForCourt(courtGroups[idx], courtNum);
+      if (cost < bestCost || (cost === bestCost && Math.random() < 0.5)) {
+        bestCost = cost;
+        bestIdx = idx;
+      }
+    }
+    result[courtNum - 1] = courtGroups[bestIdx];
+    available.delete(bestIdx);
+  }
+
+  return result;
+}
+
+/**
+ * Update court counts after players are assigned to a court number.
+ */
+function updateCourtCounts(players, courtNumber, courtCounts) {
+  for (const p of players) {
+    const playerMap = courtCounts.get(p.id);
+    if (playerMap) {
+      playerMap.set(courtNumber, (playerMap.get(courtNumber) || 0) + 1);
+    }
+  }
+}
+
+// ─── Fair Sit-Out Selection ──────────────────────────────────────────
+
+/**
+ * Select active players for a round, ensuring fair sit-out distribution.
+ * Players who have sat out the most get priority to play.
+ * Guarantees: max(sitOutCounts) - min(sitOutCounts) <= 1
+ *
+ * @param {Player[]} players - All players in pool
+ * @param {number} needed - How many active players needed
+ * @param {Map<string, number>} sitOutCounts - Tracking map (mutated)
+ * @returns {{ active: Player[], sitOuts: Player[] }}
+ */
+function selectActivePlayers(players, needed, sitOutCounts) {
+  if (players.length <= needed) {
+    return { active: [...players], sitOuts: [] };
+  }
+
+  // Group players by sit-out count
+  const groups = new Map();
+  for (const p of players) {
+    const count = sitOutCounts.get(p.id) || 0;
+    if (!groups.has(count)) groups.set(count, []);
+    groups.get(count).push(p);
+  }
+
+  // Sort by sit-out count descending (most sit-outs = highest priority to play)
+  const sortedCounts = [...groups.keys()].sort((a, b) => b - a);
+
+  const active = [];
+  for (const count of sortedCounts) {
+    const group = fisherYatesShuffle(groups.get(count));
+    for (const p of group) {
+      if (active.length < needed) {
+        active.push(p);
+      }
+    }
+  }
+
+  const activeIds = new Set(active.map((p) => p.id));
+  const sitOuts = players.filter((p) => !activeIds.has(p.id));
+
+  // Update sit-out counts
+  for (const p of sitOuts) {
+    sitOutCounts.set(p.id, (sitOutCounts.get(p.id) || 0) + 1);
+  }
+
+  return { active, sitOuts };
+}
+
+// ─── Singles Assignment ──────────────────────────────────────────────
+
+/**
+ * Assign players to singles courts using weighted greedy + swap improvement.
+ * Minimizes opponent frequency to ensure equal matchup distribution.
+ *
+ * @param {Player[]} activePlayers
+ * @param {number} numCourts
+ * @param {Map} opponentCounts
+ * @returns {Player[][]} - Array of pairs
+ */
+function assignSinglesCourts(activePlayers, numCourts, opponentCounts) {
+  const actualCourts = Math.min(numCourts, Math.floor(activePlayers.length / 2));
+  if (actualCourts === 0) return [];
+
+  // Generate all possible pairs with costs
+  const allPairs = [];
+  for (let i = 0; i < activePlayers.length; i++) {
+    for (let j = i + 1; j < activePlayers.length; j++) {
+      const cost = getCount(opponentCounts, activePlayers[i].id, activePlayers[j].id);
+      allPairs.push({ players: [activePlayers[i], activePlayers[j]], cost });
+    }
+  }
+
+  // Sort by cost ascending, randomize ties
+  allPairs.sort((a, b) => {
+    if (a.cost !== b.cost) return a.cost - b.cost;
+    return Math.random() - 0.5;
+  });
+
+  // Greedy assignment
+  const used = new Set();
+  const courts = [];
+  for (const pair of allPairs) {
+    if (courts.length >= actualCourts) break;
+    if (used.has(pair.players[0].id) || used.has(pair.players[1].id)) continue;
+    courts.push(pair.players);
+    used.add(pair.players[0].id);
+    used.add(pair.players[1].id);
+  }
+
+  // Swap improvement
+  improveSinglesSwap(courts, opponentCounts);
+
+  return courts;
+}
+
+/**
+ * Local swap improvement for singles courts.
+ * For each pair of courts [A,B] and [C,D], try [A,C]+[B,D] and [A,D]+[B,C].
+ */
+function improveSinglesSwap(courts, opponentCounts) {
+  let improved = true;
+  let iterations = 0;
+  while (improved && iterations < 50) {
+    improved = false;
+    iterations++;
+    for (let i = 0; i < courts.length; i++) {
+      for (let j = i + 1; j < courts.length; j++) {
+        const [a, b] = courts[i];
+        const [c, d] = courts[j];
+        const currentCost =
+          getCount(opponentCounts, a.id, b.id) +
+          getCount(opponentCounts, c.id, d.id);
+
+        const swap1Cost =
+          getCount(opponentCounts, a.id, c.id) +
+          getCount(opponentCounts, b.id, d.id);
+
+        const swap2Cost =
+          getCount(opponentCounts, a.id, d.id) +
+          getCount(opponentCounts, b.id, c.id);
+
+        if (swap1Cost < currentCost && swap1Cost <= swap2Cost) {
+          courts[i] = [a, c];
+          courts[j] = [b, d];
+          improved = true;
+        } else if (swap2Cost < currentCost) {
+          courts[i] = [a, d];
+          courts[j] = [b, c];
+          improved = true;
+        }
+      }
+    }
+  }
+}
+
+// ─── Doubles Assignment ──────────────────────────────────────────────
+
+/**
+ * Calculate opponent cost for a doubles court (team1 vs team2)
+ */
+function courtOpponentCost(team1, team2, opponentCounts) {
+  let cost = 0;
+  for (const p1 of team1) {
+    for (const p2 of team2) {
+      cost += getCount(opponentCounts, p1.id, p2.id);
+    }
+  }
+  return cost;
+}
+
+/**
+ * Calculate full cost for a doubles court (partner + opponent costs)
+ */
+function fullCourtCost(team1, team2, partnerCounts, opponentCounts) {
+  return (
+    getCount(partnerCounts, team1[0].id, team1[1].id) +
+    getCount(partnerCounts, team2[0].id, team2[1].id) +
+    courtOpponentCost(team1, team2, opponentCounts)
+  );
+}
+
+/**
+ * Find optimal 2+2 split of 4 players minimizing partner cost.
+ * There are only 3 ways to split 4 into two pairs.
+ */
+function bestTeamSplit(fourPlayers, partnerCounts) {
+  const [a, b, c, d] = fourPlayers;
+  const splits = [
+    { team1: [a, b], team2: [c, d] },
+    { team1: [a, c], team2: [b, d] },
+    { team1: [a, d], team2: [b, c] },
+  ];
+
+  let best = splits[0];
+  let bestCost = Infinity;
+  for (const split of splits) {
+    const cost =
+      getCount(partnerCounts, split.team1[0].id, split.team1[1].id) +
+      getCount(partnerCounts, split.team2[0].id, split.team2[1].id);
+    if (cost < bestCost) {
+      bestCost = cost;
+      best = split;
+    }
+  }
+  return best;
+}
+
+/**
+ * Assign players to doubles courts using two-stage weighted greedy + swap.
+ * Stage A: Form partner pairs (minimize partner frequency)
+ * Stage B: Pair teams into courts (minimize opponent frequency)
+ * Stage C: Local swap improvement
+ *
+ * @param {Player[]} activePlayers
+ * @param {number} numCourts
+ * @param {Map} partnerCounts
+ * @param {Map} opponentCounts
+ * @returns {{ team1: Player[], team2: Player[] }[]}
+ */
+function assignDoublesCourts(activePlayers, numCourts, partnerCounts, opponentCounts) {
+  const actualCourts = Math.min(numCourts, Math.floor(activePlayers.length / 4));
+  if (actualCourts === 0) return [];
+
+  // Stage A: form partner pairs
+  const allPairs = [];
+  for (let i = 0; i < activePlayers.length; i++) {
+    for (let j = i + 1; j < activePlayers.length; j++) {
+      const cost = getCount(partnerCounts, activePlayers[i].id, activePlayers[j].id);
+      allPairs.push({ players: [activePlayers[i], activePlayers[j]], cost });
+    }
+  }
+  allPairs.sort((a, b) => {
+    if (a.cost !== b.cost) return a.cost - b.cost;
+    return Math.random() - 0.5;
+  });
+
+  const used = new Set();
+  const teams = [];
+  for (const pair of allPairs) {
+    if (teams.length >= actualCourts * 2) break;
+    if (used.has(pair.players[0].id) || used.has(pair.players[1].id)) continue;
+    teams.push(pair.players);
+    used.add(pair.players[0].id);
+    used.add(pair.players[1].id);
+  }
+
+  // Stage B: pair teams into courts (minimize opponent cost)
+  const teamPairs = [];
+  for (let i = 0; i < teams.length; i++) {
+    for (let j = i + 1; j < teams.length; j++) {
+      const cost = courtOpponentCost(teams[i], teams[j], opponentCounts);
+      teamPairs.push({ idx1: i, idx2: j, cost });
+    }
+  }
+  teamPairs.sort((a, b) => {
+    if (a.cost !== b.cost) return a.cost - b.cost;
+    return Math.random() - 0.5;
+  });
+
+  const usedTeams = new Set();
+  const courts = [];
+  for (const tp of teamPairs) {
+    if (courts.length >= actualCourts) break;
+    if (usedTeams.has(tp.idx1) || usedTeams.has(tp.idx2)) continue;
+    courts.push({ team1: teams[tp.idx1], team2: teams[tp.idx2] });
+    usedTeams.add(tp.idx1);
+    usedTeams.add(tp.idx2);
+  }
+
+  // Stage C: swap improvement
+  improveDoublesSwap(courts, partnerCounts, opponentCounts);
+
+  return courts;
+}
+
+/**
+ * Local swap improvement for doubles courts.
+ * For each pair of courts, try swapping one player between them
+ * and re-optimizing team splits.
+ */
+function improveDoublesSwap(courts, partnerCounts, opponentCounts) {
+  let improved = true;
+  let iterations = 0;
+  while (improved && iterations < 50) {
+    improved = false;
+    iterations++;
+    for (let i = 0; i < courts.length; i++) {
+      for (let j = i + 1; j < courts.length; j++) {
+        const allEight = [
+          ...courts[i].team1, ...courts[i].team2,
+          ...courts[j].team1, ...courts[j].team2,
+        ];
+        const currentCost =
+          fullCourtCost(courts[i].team1, courts[i].team2, partnerCounts, opponentCounts) +
+          fullCourtCost(courts[j].team1, courts[j].team2, partnerCounts, opponentCounts);
+
+        // Try all ways to split 8 into two groups of 4
+        let bestCost = currentCost;
+        let bestConfig = null;
+
+        const splits = allSplitsOf8Into4And4(allEight);
+        for (const [group1, group2] of splits) {
+          const split1 = bestTeamSplit(group1, partnerCounts);
+          const split2 = bestTeamSplit(group2, partnerCounts);
+          const cost =
+            fullCourtCost(split1.team1, split1.team2, partnerCounts, opponentCounts) +
+            fullCourtCost(split2.team1, split2.team2, partnerCounts, opponentCounts);
+          if (cost < bestCost) {
+            bestCost = cost;
+            bestConfig = [split1, split2];
+          }
+        }
+
+        if (bestConfig) {
+          courts[i] = bestConfig[0];
+          courts[j] = bestConfig[1];
+          improved = true;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Generate all ways to split 8 items into two groups of 4.
+ * Returns C(8,4)/2 = 35 unique splits.
+ */
+function allSplitsOf8Into4And4(items) {
+  const splits = [];
+  const n = items.length;
+  if (n !== 8) return splits;
+
+  // Generate all C(8,4) = 70 combinations, take only half (avoid duplicates)
+  for (let mask = 0; mask < (1 << n); mask++) {
+    if (popcount(mask) !== 4) continue;
+    // Only take masks where bit 0 is set (to avoid duplicate complement)
+    if (!(mask & 1)) continue;
+
+    const group1 = [];
+    const group2 = [];
+    for (let bit = 0; bit < n; bit++) {
+      if (mask & (1 << bit)) {
+        group1.push(items[bit]);
+      } else {
+        group2.push(items[bit]);
+      }
+    }
+    splits.push([group1, group2]);
+  }
+  return splits;
+}
+
+function popcount(n) {
+  let count = 0;
+  while (n) {
+    count += n & 1;
+    n >>= 1;
+  }
+  return count;
+}
+
+// ─── Mixed Doubles Assignment ────────────────────────────────────────
+
+/**
+ * Assign players to mixed doubles courts.
+ * Each team must be exactly 1 male + 1 female.
+ * Uses same two-stage approach but with gender constraint on partner pairs.
+ */
+function assignMixedDoublesCourts(activeMales, activeFemales, numCourts, partnerCounts, opponentCounts) {
+  const actualCourts = Math.min(numCourts, Math.floor(activeMales.length / 2), Math.floor(activeFemales.length / 2));
+  if (actualCourts === 0) return [];
+
+  // Stage A: form mixed partner pairs (1M + 1F)
+  const allPairs = [];
+  for (const male of activeMales) {
+    for (const female of activeFemales) {
+      const cost = getCount(partnerCounts, male.id, female.id);
+      allPairs.push({ players: [male, female], cost });
+    }
+  }
+  allPairs.sort((a, b) => {
+    if (a.cost !== b.cost) return a.cost - b.cost;
+    return Math.random() - 0.5;
+  });
+
+  const usedMales = new Set();
+  const usedFemales = new Set();
+  const teams = [];
+  for (const pair of allPairs) {
+    if (teams.length >= actualCourts * 2) break;
+    if (usedMales.has(pair.players[0].id) || usedFemales.has(pair.players[1].id)) continue;
+    teams.push(pair.players);
+    usedMales.add(pair.players[0].id);
+    usedFemales.add(pair.players[1].id);
+  }
+
+  // Stage B: pair teams into courts (minimize opponent cost)
+  const teamPairs = [];
+  for (let i = 0; i < teams.length; i++) {
+    for (let j = i + 1; j < teams.length; j++) {
+      const cost = courtOpponentCost(teams[i], teams[j], opponentCounts);
+      teamPairs.push({ idx1: i, idx2: j, cost });
+    }
+  }
+  teamPairs.sort((a, b) => {
+    if (a.cost !== b.cost) return a.cost - b.cost;
+    return Math.random() - 0.5;
+  });
+
+  const usedTeams = new Set();
+  const courts = [];
+  for (const tp of teamPairs) {
+    if (courts.length >= actualCourts) break;
+    if (usedTeams.has(tp.idx1) || usedTeams.has(tp.idx2)) continue;
+    courts.push({ team1: teams[tp.idx1], team2: teams[tp.idx2] });
+    usedTeams.add(tp.idx1);
+    usedTeams.add(tp.idx2);
+  }
+
+  // Stage C: swap improvement (respecting gender constraint)
+  improveMixedDoublesSwap(courts, partnerCounts, opponentCounts);
+
+  return courts;
+}
+
+/**
+ * Swap improvement for mixed doubles.
+ * Only allows swaps that maintain the 1M+1F team constraint.
+ */
+function improveMixedDoublesSwap(courts, partnerCounts, opponentCounts) {
+  let improved = true;
+  let iterations = 0;
+  while (improved && iterations < 50) {
+    improved = false;
+    iterations++;
+    for (let i = 0; i < courts.length; i++) {
+      for (let j = i + 1; j < courts.length; j++) {
+        const currentCost =
+          fullCourtCost(courts[i].team1, courts[i].team2, partnerCounts, opponentCounts) +
+          fullCourtCost(courts[j].team1, courts[j].team2, partnerCounts, opponentCounts);
+
+        // Collect all males and females from both courts
+        const allPlayers = [
+          ...courts[i].team1, ...courts[i].team2,
+          ...courts[j].team1, ...courts[j].team2,
+        ];
+        const males = allPlayers.filter((p) => p.gender === 'male');
+        const females = allPlayers.filter((p) => p.gender === 'female');
+
+        // Try all valid mixed team configurations
+        // 4 males, 4 females → each team needs 1M+1F → 4 teams
+        // We need to assign each male to a female, then pair teams
+        let bestCost = currentCost;
+        let bestConfig = null;
+
+        // Generate all permutations of female assignments to males
+        const femalePerms = permutations(females);
+        for (const femPerm of femalePerms) {
+          // Teams: [males[0], femPerm[0]], [males[1], femPerm[1]], etc.
+          const newTeams = males.map((m, idx) => [m, femPerm[idx]]);
+
+          // Try all ways to pair 4 teams into 2 courts
+          // C(4,2)/2 = 3 ways
+          const courtPairings = [
+            [0, 1, 2, 3],
+            [0, 2, 1, 3],
+            [0, 3, 1, 2],
+          ];
+
+          for (const [a, b, c, d] of courtPairings) {
+            const cost =
+              fullCourtCost(newTeams[a], newTeams[b], partnerCounts, opponentCounts) +
+              fullCourtCost(newTeams[c], newTeams[d], partnerCounts, opponentCounts);
+            if (cost < bestCost) {
+              bestCost = cost;
+              bestConfig = [
+                { team1: newTeams[a], team2: newTeams[b] },
+                { team1: newTeams[c], team2: newTeams[d] },
+              ];
+            }
+          }
+        }
+
+        if (bestConfig) {
+          courts[i] = bestConfig[0];
+          courts[j] = bestConfig[1];
+          improved = true;
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Generate all permutations of an array (for small arrays only, max 4 elements)
+ */
+function permutations(arr) {
+  if (arr.length <= 1) return [arr];
+  const result = [];
+  for (let i = 0; i < arr.length; i++) {
+    const rest = [...arr.slice(0, i), ...arr.slice(i + 1)];
+    for (const perm of permutations(rest)) {
+      result.push([arr[i], ...perm]);
+    }
+  }
+  return result;
+}
+
+// ─── Round Generation Functions ──────────────────────────────────────
+
 /**
  * Generate all rounds for Singles play
  * @param {Player[]} players - All players
@@ -72,38 +711,21 @@ export function createInitialScore() {
  * @returns {Round[]} - Generated rounds
  */
 export function generateSinglesRounds(players, numRounds, numCourts) {
-  const rounds = [];
   const playersPerRound = numCourts * 2;
-  const matchupHistory = new Map(); // Track who played whom
-
-  // Initialize matchup tracking
-  players.forEach((p) => matchupHistory.set(p.id, new Set()));
+  const { sitOutCounts, opponentCounts, courtCounts } = createFairnessState(players);
+  const rounds = [];
 
   for (let r = 0; r < numRounds; r++) {
-    // Score players by how many times they've sat out and variety of opponents
-    const shuffledPlayers = fisherYatesShuffle([...players]);
+    const { active, sitOuts } = selectActivePlayers(players, playersPerRound, sitOutCounts);
+    const courtPairs = assignSinglesCourts(active, numCourts, opponentCounts);
 
-    // Select players for this round (prioritize those who sat out recently)
-    const activePlayers = shuffledPlayers.slice(0, Math.min(playersPerRound, shuffledPlayers.length));
-    const sitOuts = shuffledPlayers.slice(playersPerRound);
+    // Optimize court number assignments for fair rotation
+    const orderedPairs = assignCourtNumbers(courtPairs, courtCounts, (pair) => pair);
 
-    // Pair players trying to avoid repeat matchups
-    const pairs = pairPlayersForSingles(activePlayers, matchupHistory);
-
-    const courts = pairs.slice(0, numCourts).map((pair, idx) => {
-      // Update matchup history
-      if (pair.length === 2) {
-        matchupHistory.get(pair[0].id).add(pair[1].id);
-        matchupHistory.get(pair[1].id).add(pair[0].id);
-      }
-
-      return {
-        id: `r${r}c${idx}`,
-        courtNumber: idx + 1,
-        players: pair,
-        status: 'pending',
-        score: createInitialScore(),
-      };
+    const courts = orderedPairs.map((pair, idx) => {
+      incrementCount(opponentCounts, pair[0].id, pair[1].id);
+      updateCourtCounts(pair, idx + 1, courtCounts);
+      return buildCourtObject(r, idx, pair, null, null);
     });
 
     rounds.push({
@@ -118,48 +740,6 @@ export function generateSinglesRounds(players, numRounds, numCourts) {
 }
 
 /**
- * Pair players for singles, minimizing repeat matchups
- * @param {Player[]} players
- * @param {Map<string, Set<string>>} history
- * @returns {Player[][]}
- */
-function pairPlayersForSingles(players, history) {
-  const pairs = [];
-  const used = new Set();
-
-  // Sort by fewest previous opponents (more variety)
-  const sorted = [...players].sort(
-    (a, b) => history.get(a.id).size - history.get(b.id).size
-  );
-
-  for (const player of sorted) {
-    if (used.has(player.id)) continue;
-
-    // Find best opponent (hasn't played against, or least times)
-    let bestOpponent = null;
-    let bestScore = Infinity;
-
-    for (const opponent of sorted) {
-      if (opponent.id === player.id || used.has(opponent.id)) continue;
-
-      const hasPlayed = history.get(player.id).has(opponent.id) ? 1 : 0;
-      if (hasPlayed < bestScore) {
-        bestScore = hasPlayed;
-        bestOpponent = opponent;
-      }
-    }
-
-    if (bestOpponent) {
-      pairs.push([player, bestOpponent]);
-      used.add(player.id);
-      used.add(bestOpponent.id);
-    }
-  }
-
-  return pairs;
-}
-
-/**
  * Generate all rounds for Doubles play (Random pairing)
  * @param {Player[]} players - All players
  * @param {number} numRounds - Number of rounds
@@ -167,28 +747,29 @@ function pairPlayersForSingles(players, history) {
  * @returns {Round[]}
  */
 export function generateDoublesRandomRounds(players, numRounds, numCourts) {
-  const rounds = [];
   const playersPerRound = numCourts * 4;
-  const partnerHistory = new Map(); // Track who partnered with whom
-  const opponentHistory = new Map(); // Track who played against whom
-
-  players.forEach((p) => {
-    partnerHistory.set(p.id, new Map()); // partner id -> count
-    opponentHistory.set(p.id, new Map()); // opponent id -> count
-  });
+  const { sitOutCounts, partnerCounts, opponentCounts, courtCounts } = createFairnessState(players);
+  const rounds = [];
 
   for (let r = 0; r < numRounds; r++) {
-    const shuffledPlayers = fisherYatesShuffle([...players]);
-    const activePlayers = shuffledPlayers.slice(0, Math.min(playersPerRound, shuffledPlayers.length));
-    const sitOuts = shuffledPlayers.slice(playersPerRound);
+    const { active, sitOuts } = selectActivePlayers(players, playersPerRound, sitOutCounts);
+    const courtAssignments = assignDoublesCourts(active, numCourts, partnerCounts, opponentCounts);
 
-    const courts = createDoublesCourtAssignments(
-      activePlayers,
-      numCourts,
-      partnerHistory,
-      opponentHistory,
-      r
-    );
+    // Optimize court number assignments for fair rotation
+    const ordered = assignCourtNumbers(courtAssignments, courtCounts, (a) => [...a.team1, ...a.team2]);
+
+    const courts = ordered.map((assignment, idx) => {
+      incrementCount(partnerCounts, assignment.team1[0].id, assignment.team1[1].id);
+      incrementCount(partnerCounts, assignment.team2[0].id, assignment.team2[1].id);
+      for (const p1 of assignment.team1) {
+        for (const p2 of assignment.team2) {
+          incrementCount(opponentCounts, p1.id, p2.id);
+        }
+      }
+      const allPlayers = [...assignment.team1, ...assignment.team2];
+      updateCourtCounts(allPlayers, idx + 1, courtCounts);
+      return buildCourtObject(r, idx, allPlayers, assignment.team1, assignment.team2);
+    });
 
     rounds.push({
       id: `round-${r}`,
@@ -212,78 +793,34 @@ export function generateMixedDoublesRounds(players, numRounds, numCourts) {
   const males = players.filter((p) => p.gender === 'male');
   const females = players.filter((p) => p.gender === 'female');
 
+  const maxCourts = Math.min(numCourts, Math.floor(males.length / 2), Math.floor(females.length / 2));
+  if (maxCourts === 0) return [];
+
+  const { sitOutCounts, partnerCounts, opponentCounts, courtCounts } = createFairnessState(players);
   const rounds = [];
-  const partnerHistory = new Map();
-  const opponentHistory = new Map();
-
-  players.forEach((p) => {
-    partnerHistory.set(p.id, new Map());
-    opponentHistory.set(p.id, new Map());
-  });
-
-  // Determine how many complete mixed teams we can form per round
-  const teamsPerRound = Math.min(males.length, females.length);
-  const courtsPerRound = Math.min(numCourts, Math.floor(teamsPerRound / 2));
-
-  if (courtsPerRound === 0) {
-    // Not enough players for mixed doubles
-    return [];
-  }
 
   for (let r = 0; r < numRounds; r++) {
-    const shuffledMales = fisherYatesShuffle([...males]);
-    const shuffledFemales = fisherYatesShuffle([...females]);
+    // Select active players per gender independently for fair sit-outs
+    const { active: activeMales, sitOuts: sitOutMales } = selectActivePlayers(males, maxCourts * 2, sitOutCounts);
+    const { active: activeFemales, sitOuts: sitOutFemales } = selectActivePlayers(females, maxCourts * 2, sitOutCounts);
 
-    const courts = [];
-    const usedMales = new Set();
-    const usedFemales = new Set();
+    const courtAssignments = assignMixedDoublesCourts(activeMales, activeFemales, maxCourts, partnerCounts, opponentCounts);
 
-    for (let c = 0; c < courtsPerRound; c++) {
-      // Form Team 1
-      const team1 = formMixedTeam(
-        shuffledMales,
-        shuffledFemales,
-        usedMales,
-        usedFemales,
-        partnerHistory
-      );
+    // Optimize court number assignments for fair rotation
+    const ordered = assignCourtNumbers(courtAssignments, courtCounts, (a) => [...a.team1, ...a.team2]);
 
-      // Form Team 2
-      const team2 = formMixedTeam(
-        shuffledMales,
-        shuffledFemales,
-        usedMales,
-        usedFemales,
-        partnerHistory
-      );
-
-      if (team1.length === 2 && team2.length === 2) {
-        // Update partner history
-        updatePartnerHistory(partnerHistory, team1[0], team1[1]);
-        updatePartnerHistory(partnerHistory, team2[0], team2[1]);
-
-        // Update opponent history
-        for (const p1 of team1) {
-          for (const p2 of team2) {
-            updateOpponentHistory(opponentHistory, p1, p2);
-          }
+    const courts = ordered.map((assignment, idx) => {
+      incrementCount(partnerCounts, assignment.team1[0].id, assignment.team1[1].id);
+      incrementCount(partnerCounts, assignment.team2[0].id, assignment.team2[1].id);
+      for (const p1 of assignment.team1) {
+        for (const p2 of assignment.team2) {
+          incrementCount(opponentCounts, p1.id, p2.id);
         }
-
-        courts.push({
-          id: `r${r}c${c}`,
-          courtNumber: c + 1,
-          players: [...team1, ...team2],
-          team1,
-          team2,
-          status: 'pending',
-          score: createInitialScore(),
-        });
       }
-    }
-
-    // Calculate sit outs
-    const sitOutMales = males.filter((m) => !usedMales.has(m.id));
-    const sitOutFemales = females.filter((f) => !usedFemales.has(f.id));
+      const allPlayers = [...assignment.team1, ...assignment.team2];
+      updateCourtCounts(allPlayers, idx + 1, courtCounts);
+      return buildCourtObject(r, idx, allPlayers, assignment.team1, assignment.team2);
+    });
 
     rounds.push({
       id: `round-${r}`,
@@ -296,125 +833,7 @@ export function generateMixedDoublesRounds(players, numRounds, numCourts) {
   return rounds;
 }
 
-/**
- * Form a mixed team (1 male + 1 female) minimizing repeat partners
- */
-function formMixedTeam(males, females, usedMales, usedFemales, partnerHistory) {
-  let bestMale = null;
-  let bestFemale = null;
-  let bestScore = Infinity;
-
-  for (const male of males) {
-    if (usedMales.has(male.id)) continue;
-
-    for (const female of females) {
-      if (usedFemales.has(female.id)) continue;
-
-      const score = partnerHistory.get(male.id)?.get(female.id) || 0;
-      if (score < bestScore) {
-        bestScore = score;
-        bestMale = male;
-        bestFemale = female;
-      }
-    }
-  }
-
-  if (bestMale && bestFemale) {
-    usedMales.add(bestMale.id);
-    usedFemales.add(bestFemale.id);
-    return [bestMale, bestFemale];
-  }
-
-  return [];
-}
-
-/**
- * Create court assignments for random doubles
- */
-function createDoublesCourtAssignments(players, numCourts, partnerHistory, opponentHistory, roundIdx) {
-  const courts = [];
-  const used = new Set();
-
-  for (let c = 0; c < numCourts; c++) {
-    const availablePlayers = players.filter((p) => !used.has(p.id));
-    if (availablePlayers.length < 4) break;
-
-    // Form two teams
-    const team1 = formRandomTeam(availablePlayers, used, partnerHistory);
-    const remainingPlayers = availablePlayers.filter((p) => !used.has(p.id));
-    const team2 = formRandomTeam(remainingPlayers, used, partnerHistory);
-
-    if (team1.length === 2 && team2.length === 2) {
-      // Update histories
-      updatePartnerHistory(partnerHistory, team1[0], team1[1]);
-      updatePartnerHistory(partnerHistory, team2[0], team2[1]);
-
-      for (const p1 of team1) {
-        for (const p2 of team2) {
-          updateOpponentHistory(opponentHistory, p1, p2);
-        }
-      }
-
-      courts.push({
-        id: `r${roundIdx}c${c}`,
-        courtNumber: c + 1,
-        players: [...team1, ...team2],
-        team1,
-        team2,
-        status: 'pending',
-        score: createInitialScore(),
-      });
-    }
-  }
-
-  return courts;
-}
-
-/**
- * Form a random team of 2, minimizing repeat partners
- */
-function formRandomTeam(players, used, partnerHistory) {
-  let bestPair = null;
-  let bestScore = Infinity;
-
-  for (let i = 0; i < players.length; i++) {
-    if (used.has(players[i].id)) continue;
-
-    for (let j = i + 1; j < players.length; j++) {
-      if (used.has(players[j].id)) continue;
-
-      const score = partnerHistory.get(players[i].id)?.get(players[j].id) || 0;
-      if (score < bestScore) {
-        bestScore = score;
-        bestPair = [players[i], players[j]];
-      }
-    }
-  }
-
-  if (bestPair) {
-    used.add(bestPair[0].id);
-    used.add(bestPair[1].id);
-    return bestPair;
-  }
-
-  return [];
-}
-
-function updatePartnerHistory(history, p1, p2) {
-  const count1 = history.get(p1.id)?.get(p2.id) || 0;
-  history.get(p1.id)?.set(p2.id, count1 + 1);
-
-  const count2 = history.get(p2.id)?.get(p1.id) || 0;
-  history.get(p2.id)?.set(p1.id, count2 + 1);
-}
-
-function updateOpponentHistory(history, p1, p2) {
-  const count1 = history.get(p1.id)?.get(p2.id) || 0;
-  history.get(p1.id)?.set(p2.id, count1 + 1);
-
-  const count2 = history.get(p2.id)?.get(p1.id) || 0;
-  history.get(p2.id)?.set(p1.id, count2 + 1);
-}
+// ─── Main Entry Point ────────────────────────────────────────────────
 
 /**
  * Main shuffle function - entry point

@@ -40,6 +40,13 @@ export default function OrganizerScreen({ sessionCode, onLeave, onSessionUpdate,
   const [isEditingSessionName, setIsEditingSessionName] = useState(false);
   const [tempSessionName, setTempSessionName] = useState('');
 
+  // Court names (session-level, survives reshuffles)
+  const [courtNames, setCourtNames] = useState(initialData?.courtNames || {});
+  const [editingCourtNumber, setEditingCourtNumber] = useState(null);
+  const [tempCourtName, setTempCourtName] = useState('');
+
+  const getCourtName = (courtNumber) => courtNames[courtNumber] || `Court ${courtNumber}`;
+
   // Track if this is initial mount to avoid saving on restore
   const isInitialMount = useRef(true);
 
@@ -70,12 +77,13 @@ export default function OrganizerScreen({ sessionCode, onLeave, onSessionUpdate,
           players,
           rounds,
           isShuffled,
+          courtNames,
         });
       }
     }, 500);
 
     return () => clearTimeout(timeoutId);
-  }, [sessionName, gameType, pairingMode, numRounds, numCourts, players, rounds, isShuffled, onSessionUpdate]);
+  }, [sessionName, gameType, pairingMode, numRounds, numCourts, players, rounds, isShuffled, courtNames, onSessionUpdate]);
 
   const playerCounts = useMemo(() => {
     const males = players.filter((p) => p.gender === 'male').length;
@@ -155,11 +163,35 @@ export default function OrganizerScreen({ sessionCode, onLeave, onSessionUpdate,
 
   const savePlayerEdit = () => {
     if (!editingPlayer || !editName.trim()) return;
+    const updatedName = editName.trim();
+    const updatedGender = editGender;
+    const playerId = editingPlayer.id;
+
     setPlayers((prev) =>
       prev.map((p) =>
-        p.id === editingPlayer.id ? { ...p, name: editName.trim(), gender: editGender } : p
+        p.id === playerId ? { ...p, name: updatedName, gender: updatedGender } : p
       )
     );
+
+    // Propagate name/gender changes into existing rounds so matchups are preserved
+    if (isShuffled && rounds.length > 0) {
+      const updatePlayer = (p) =>
+        p && p.id === playerId ? { ...p, name: updatedName, gender: updatedGender } : p;
+
+      setRounds((prev) =>
+        prev.map((round) => ({
+          ...round,
+          sitOuts: round.sitOuts?.map(updatePlayer) || [],
+          courts: round.courts.map((court) => ({
+            ...court,
+            players: court.players.map(updatePlayer),
+            ...(court.team1 ? { team1: court.team1.map(updatePlayer) } : {}),
+            ...(court.team2 ? { team2: court.team2.map(updatePlayer) } : {}),
+          })),
+        }))
+      );
+    }
+
     setEditingPlayer(null);
     setEditName('');
     setEditGender('male');
@@ -172,7 +204,7 @@ export default function OrganizerScreen({ sessionCode, onLeave, onSessionUpdate,
   };
 
   /**
-   * Generate player slots based on count input
+   * Generate initial player slots based on count input
    */
   const generatePlayerSlots = () => {
     const count = parseInt(playerCountInput, 10);
@@ -190,10 +222,51 @@ export default function OrganizerScreen({ sessionCode, onLeave, onSessionUpdate,
       newPlayers.push({
         id: `player-${i}-${Date.now()}`,
         name: `Player ${i}`,
-        gender: 'male', // Default gender, can be edited
+        gender: 'male',
       });
     }
     setPlayers(newPlayers);
+    setError('');
+  };
+
+  const addPlayer = () => {
+    if (players.length >= 50) {
+      setError('Maximum 50 players allowed');
+      return;
+    }
+    // Find the next player number by checking existing default names
+    let maxNum = 0;
+    for (const p of players) {
+      const match = p.name.match(/^Player (\d+)$/);
+      if (match) maxNum = Math.max(maxNum, parseInt(match[1], 10));
+    }
+    const nextNum = Math.max(maxNum + 1, players.length + 1);
+    setPlayers((prev) => [
+      ...prev,
+      { id: `player-${nextNum}-${Date.now()}`, name: `Player ${nextNum}`, gender: 'male' },
+    ]);
+    setError('');
+  };
+
+  const removeLastPlayer = () => {
+    if (players.length <= 1) return;
+    // Priority 1: remove the player with the highest "Player N" default name
+    // Priority 2: remove an unedited player (still has default name)
+    // Priority 3: remove the last player in the list
+    let removeIdx = -1;
+    let highestNum = -1;
+    for (let i = 0; i < players.length; i++) {
+      const match = players[i].name.match(/^Player (\d+)$/);
+      if (match) {
+        const num = parseInt(match[1], 10);
+        if (num > highestNum) {
+          highestNum = num;
+          removeIdx = i;
+        }
+      }
+    }
+    if (removeIdx === -1) removeIdx = players.length - 1;
+    setPlayers((prev) => prev.filter((_, i) => i !== removeIdx));
     setError('');
   };
 
@@ -261,7 +334,41 @@ export default function OrganizerScreen({ sessionCode, onLeave, onSessionUpdate,
         ]}
       >
         <View style={styles.courtHeader}>
-          <Text style={styles.courtTitle}>Court {court.courtNumber}</Text>
+          {editingCourtNumber === court.courtNumber ? (
+            <View style={styles.courtNameEditRow}>
+              <TextInput
+                style={styles.courtNameInput}
+                value={tempCourtName}
+                onChangeText={setTempCourtName}
+                autoFocus
+                selectTextOnFocus
+                onSubmitEditing={() => {
+                  if (tempCourtName.trim()) {
+                    setCourtNames((prev) => ({ ...prev, [court.courtNumber]: tempCourtName.trim() }));
+                  }
+                  setEditingCourtNumber(null);
+                }}
+                onBlur={() => {
+                  if (tempCourtName.trim()) {
+                    setCourtNames((prev) => ({ ...prev, [court.courtNumber]: tempCourtName.trim() }));
+                  }
+                  setEditingCourtNumber(null);
+                }}
+              />
+            </View>
+          ) : (
+            <TouchableOpacity
+              onPress={() => {
+                setEditingCourtNumber(court.courtNumber);
+                setTempCourtName(getCourtName(court.courtNumber));
+              }}
+              activeOpacity={0.7}
+              style={styles.courtTitleTouchable}
+            >
+              <Text style={styles.courtTitle}>{getCourtName(court.courtNumber)}</Text>
+              <Text style={styles.courtTitleEditIcon}>✎</Text>
+            </TouchableOpacity>
+          )}
           <TouchableOpacity
             onPress={() => toggleCourtStatus(roundId, court.id)}
             style={styles.statusButton}
@@ -341,44 +448,63 @@ export default function OrganizerScreen({ sessionCode, onLeave, onSessionUpdate,
         )}
       </View>
 
-      {/* Player Count Input */}
-      <View style={styles.playerCountSection}>
-        <Text style={styles.playerCountLabel}>Number of Players</Text>
-        <View style={styles.playerCountRow}>
-          <View style={styles.playerCountInputRow}>
+      {/* Player Count Controls */}
+      {players.length === 0 ? (
+        <View style={styles.playerCountSection}>
+          <Text style={styles.playerCountLabel}>Number of Players</Text>
+          <View style={styles.playerCountRow}>
+            <View style={styles.playerCountInputRow}>
+              <TouchableOpacity
+                style={styles.playerCountButton}
+                onPress={() => setPlayerCountInput((n) => Math.max(2, parseInt(n, 10) - 1).toString())}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.playerCountButtonText}>−</Text>
+              </TouchableOpacity>
+              <TextInput
+                style={styles.playerCountInput}
+                value={playerCountInput}
+                onChangeText={(t) => setPlayerCountInput(t.replace(/[^0-9]/g, ''))}
+                keyboardType="number-pad"
+                maxLength={2}
+              />
+              <TouchableOpacity
+                style={styles.playerCountButton}
+                onPress={() => setPlayerCountInput((n) => Math.min(50, parseInt(n, 10) + 1).toString())}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.playerCountButtonText}>+</Text>
+              </TouchableOpacity>
+            </View>
             <TouchableOpacity
-              style={styles.playerCountButton}
-              onPress={() => setPlayerCountInput((n) => Math.max(2, parseInt(n, 10) - 1).toString())}
-              activeOpacity={0.7}
+              style={styles.generateButton}
+              onPress={generatePlayerSlots}
+              activeOpacity={0.8}
             >
-              <Text style={styles.playerCountButtonText}>−</Text>
-            </TouchableOpacity>
-            <TextInput
-              style={styles.playerCountInput}
-              value={playerCountInput}
-              onChangeText={(t) => setPlayerCountInput(t.replace(/[^0-9]/g, ''))}
-              keyboardType="number-pad"
-              maxLength={2}
-            />
-            <TouchableOpacity
-              style={styles.playerCountButton}
-              onPress={() => setPlayerCountInput((n) => Math.min(50, parseInt(n, 10) + 1).toString())}
-              activeOpacity={0.7}
-            >
-              <Text style={styles.playerCountButtonText}>+</Text>
+              <Text style={styles.generateButtonText}>Generate Players</Text>
             </TouchableOpacity>
           </View>
+        </View>
+      ) : (
+        <View style={styles.playerAddRemoveRow}>
           <TouchableOpacity
-            style={styles.generateButton}
-            onPress={generatePlayerSlots}
-            activeOpacity={0.8}
+            style={[styles.playerAddRemoveButton, players.length <= 1 && styles.playerAddRemoveDisabled]}
+            onPress={removeLastPlayer}
+            activeOpacity={0.7}
+            disabled={players.length <= 1}
           >
-            <Text style={styles.generateButtonText}>
-              {players.length > 0 ? 'Regenerate' : 'Generate Players'}
-            </Text>
+            <Text style={[styles.playerAddRemoveText, players.length <= 1 && styles.playerAddRemoveTextDisabled]}>− Remove</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.playerAddRemoveButton, players.length >= 50 && styles.playerAddRemoveDisabled]}
+            onPress={addPlayer}
+            activeOpacity={0.7}
+            disabled={players.length >= 50}
+          >
+            <Text style={[styles.playerAddRemoveText, players.length >= 50 && styles.playerAddRemoveTextDisabled]}>+ Add</Text>
           </TouchableOpacity>
         </View>
-      </View>
+      )}
 
       {/* Player List */}
       {players.length > 0 ? (
@@ -386,6 +512,13 @@ export default function OrganizerScreen({ sessionCode, onLeave, onSessionUpdate,
           <View style={styles.playerGrid}>
             {players.map((player) => (
               <View key={player.id} style={styles.playerChip}>
+                <TouchableOpacity
+                  onPress={() => removePlayer(player.id)}
+                  style={styles.removeButton}
+                  activeOpacity={0.7}
+                >
+                  <Text style={styles.removeButtonText}>×</Text>
+                </TouchableOpacity>
                 <Text style={styles.playerChipText}>
                   {player.name}
                   <Text style={styles.genderIndicator}>
@@ -398,13 +531,6 @@ export default function OrganizerScreen({ sessionCode, onLeave, onSessionUpdate,
                   activeOpacity={0.7}
                 >
                   <Text style={styles.editButtonText}>✎</Text>
-                </TouchableOpacity>
-                <TouchableOpacity
-                  onPress={() => removePlayer(player.id)}
-                  style={styles.removeButton}
-                  activeOpacity={0.7}
-                >
-                  <Text style={styles.removeButtonText}>×</Text>
                 </TouchableOpacity>
               </View>
             ))}
@@ -616,6 +742,27 @@ export default function OrganizerScreen({ sessionCode, onLeave, onSessionUpdate,
                 <TouchableOpacity onPress={resetShuffle} activeOpacity={0.7}>
                   <Text style={styles.reshuffleText}>← Edit Settings</Text>
                 </TouchableOpacity>
+              </View>
+            </View>
+
+            {/* Compact player roster for name editing */}
+            <View style={styles.compactRoster}>
+              <Text style={styles.compactRosterTitle}>Players ({players.length})</Text>
+              <View style={styles.compactRosterGrid}>
+                {players.map((player) => (
+                  <TouchableOpacity
+                    key={player.id}
+                    style={styles.compactPlayerChip}
+                    onPress={() => startEditingPlayer(player)}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.compactPlayerText}>
+                      {player.name}
+                      <Text style={styles.genderIndicator}> ({player.gender === 'male' ? 'M' : 'F'})</Text>
+                    </Text>
+                    <Text style={styles.compactEditIcon}>✎</Text>
+                  </TouchableOpacity>
+                ))}
               </View>
             </View>
 
@@ -911,7 +1058,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: colors.secondary,
     paddingVertical: 8,
-    paddingLeft: 14,
+    paddingLeft: 8,
     paddingRight: 8,
     borderRadius: 20,
     gap: spacing.xs,
@@ -1196,6 +1343,35 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: colors.text,
   },
+  courtTitleTouchable: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    ...Platform.select({
+      web: { cursor: 'pointer' },
+    }),
+  },
+  courtTitleEditIcon: {
+    fontSize: 12,
+    color: colors.textMuted,
+  },
+  courtNameEditRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  courtNameInput: {
+    backgroundColor: colors.background,
+    borderRadius: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    fontSize: 15,
+    fontWeight: '600',
+    color: colors.text,
+    minWidth: 100,
+    ...Platform.select({
+      web: { outlineStyle: 'none' },
+    }),
+  },
   courtStatus: {
     fontSize: 12,
     color: colors.textSecondary,
@@ -1442,5 +1618,54 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: colors.textMuted,
     marginTop: spacing.xs,
+  },
+  compactRoster: {
+    backgroundColor: colors.background,
+    borderRadius: 12,
+    padding: spacing.md,
+    gap: spacing.sm,
+    ...Platform.select({
+      web: {
+        boxShadow: '0 1px 4px rgba(0, 0, 0, 0.04)',
+      },
+      default: {
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 1 },
+        shadowOpacity: 0.04,
+        shadowRadius: 4,
+        elevation: 1,
+      },
+    }),
+  },
+  compactRosterTitle: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: colors.textSecondary,
+  },
+  compactRosterGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: spacing.xs,
+  },
+  compactPlayerChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: colors.secondary,
+    paddingVertical: 5,
+    paddingLeft: 10,
+    paddingRight: 6,
+    borderRadius: 14,
+    gap: 4,
+    ...Platform.select({
+      web: { cursor: 'pointer' },
+    }),
+  },
+  compactPlayerText: {
+    fontSize: 13,
+    color: colors.text,
+  },
+  compactEditIcon: {
+    fontSize: 11,
+    color: colors.textMuted,
   },
 });
