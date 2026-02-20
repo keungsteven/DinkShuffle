@@ -12,10 +12,12 @@ import {
 } from 'react-native';
 import { shufflePlayers } from '../utils/shuffle';
 import { useResponsive, colors, spacing } from '../utils/responsive';
+import { saveSessionToCloud, saveShuffleResultsToCloud, updateCourtInCloud } from '../utils/storage';
+import { supabase } from '../utils/supabase';
 import ScoreEntry from '../components/ScoreEntry';
 import ResultsModal from '../components/ResultsModal';
 
-export default function OrganizerScreen({ sessionCode, onLeave, onSessionUpdate, initialData }) {
+export default function OrganizerScreen({ sessionCode, onLeave, onSessionUpdate, initialData, user }) {
   const { isDesktop, width } = useResponsive();
 
   // Game configuration - restore from initialData if available
@@ -85,6 +87,97 @@ export default function OrganizerScreen({ sessionCode, onLeave, onSessionUpdate,
     return () => clearTimeout(timeoutId);
   }, [sessionName, gameType, pairingMode, numRounds, numCourts, players, rounds, isShuffled, courtNames, onSessionUpdate]);
 
+  // Cloud sync: save session config to Supabase when user is logged in
+  useEffect(() => {
+    if (!user || !supabase || isInitialMount.current) return;
+
+    const timeoutId = setTimeout(() => {
+      saveSessionToCloud(sessionCode, {
+        sessionName,
+        config: { gameType, pairingMode, numRounds: parseInt(numRounds, 10) || 3, numCourts: parseInt(numCourts, 10) || 2 },
+        courtNames,
+        isShuffled,
+      });
+    }, 1000);
+
+    return () => clearTimeout(timeoutId);
+  }, [user, sessionCode, sessionName, gameType, pairingMode, numRounds, numCourts, courtNames, isShuffled]);
+
+  // Real-time: subscribe to court score/status updates from other clients
+  useEffect(() => {
+    if (!supabase || !isShuffled || rounds.length === 0) return;
+
+    const channel = supabase
+      .channel(`courts-${sessionCode}`)
+      .on('postgres_changes', {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'courts',
+      }, (payload) => {
+        const updated = payload.new;
+        setRounds((prev) =>
+          prev.map((round) => ({
+            ...round,
+            courts: round.courts.map((court) => {
+              // Match by court number within the round (best effort without round_id)
+              if (court.courtNumber !== updated.court_number) return court;
+              return {
+                ...court,
+                status: updated.status || court.status,
+                score: {
+                  team1: updated.score_team1 ?? court.score.team1,
+                  team2: updated.score_team2 ?? court.score.team2,
+                  lastUpdatedBy: updated.score_updated_by || court.score.lastUpdatedBy,
+                  lastUpdatedAt: updated.score_updated_at
+                    ? new Date(updated.score_updated_at).getTime()
+                    : court.score.lastUpdatedAt,
+                },
+              };
+            }),
+          }))
+        );
+      })
+      .subscribe();
+
+    return () => { supabase.removeChannel(channel); };
+  }, [supabase, isShuffled, rounds.length, sessionCode]);
+
+  // Real-time: subscribe to player roster changes from other clients
+  useEffect(() => {
+    if (!supabase) return;
+
+    const channel = supabase
+      .channel(`players-${sessionCode}`)
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'session_players',
+      }, (payload) => {
+        if (payload.eventType === 'INSERT') {
+          setPlayers((prev) => {
+            // Avoid duplicates
+            if (prev.some((p) => p.id === payload.new.id)) return prev;
+            return [...prev, {
+              id: payload.new.id,
+              name: payload.new.player_name,
+              gender: payload.new.gender,
+            }];
+          });
+        } else if (payload.eventType === 'DELETE') {
+          setPlayers((prev) => prev.filter((p) => p.id !== payload.old.id));
+        } else if (payload.eventType === 'UPDATE') {
+          setPlayers((prev) => prev.map((p) =>
+            p.id === payload.new.id
+              ? { ...p, name: payload.new.player_name, gender: payload.new.gender }
+              : p
+          ));
+        }
+      })
+      .subscribe();
+
+    return () => { supabase.removeChannel(channel); };
+  }, [supabase, sessionCode]);
+
   const playerCounts = useMemo(() => {
     const males = players.filter((p) => p.gender === 'male').length;
     const females = players.filter((p) => p.gender === 'female').length;
@@ -122,6 +215,11 @@ export default function OrganizerScreen({ sessionCode, onLeave, onSessionUpdate,
 
     setRounds(result.rounds);
     setIsShuffled(true);
+
+    // Persist to Supabase if logged in (fire-and-forget)
+    if (user) {
+      saveShuffleResultsToCloud(sessionCode, players, result.rounds);
+    }
   };
 
   const resetShuffle = () => {
@@ -271,13 +369,18 @@ export default function OrganizerScreen({ sessionCode, onLeave, onSessionUpdate,
   };
 
   const updateScore = (roundId, courtId, team1Score, team2Score, updaterName) => {
+    let courtNumber = null;
+    let roundNumber = null;
+
     setRounds((prev) =>
       prev.map((round) => {
         if (round.id !== roundId) return round;
+        roundNumber = round.roundNumber;
         return {
           ...round,
           courts: round.courts.map((court) => {
             if (court.id !== courtId) return court;
+            courtNumber = court.courtNumber;
             return {
               ...court,
               score: {
@@ -292,6 +395,16 @@ export default function OrganizerScreen({ sessionCode, onLeave, onSessionUpdate,
         };
       })
     );
+
+    // Sync score to cloud if logged in
+    if (user && courtNumber && roundNumber) {
+      updateCourtInCloud(sessionCode, roundNumber, courtNumber, {
+        score_team1: team1Score,
+        score_team2: team2Score,
+        score_updated_by: updaterName,
+        status: 'playing',
+      });
+    }
   };
 
   const renderOptionButton = (label, isSelected, onPress) => (

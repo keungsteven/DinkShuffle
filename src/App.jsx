@@ -2,14 +2,32 @@ import { useState, useEffect, useCallback } from 'react';
 import { SafeAreaView, StyleSheet, ActivityIndicator, View } from 'react-native';
 import LandingScreen from './screens/LandingScreen';
 import OrganizerScreen from './screens/OrganizerScreen';
+import MatchHistoryScreen from './screens/MatchHistoryScreen';
 import { loadSession, saveSession, clearSession, saveOrganizerSession } from './utils/storage';
+import { supabase } from './utils/supabase';
 
 export default function App() {
-  const [screen, setScreen] = useState('landing'); // 'landing' | 'organizer' | 'player'
+  const [screen, setScreen] = useState('landing'); // 'landing' | 'organizer' | 'player' | 'history'
   const [sessionCode, setSessionCode] = useState(null);
   const [playerInfo, setPlayerInfo] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [restoredSession, setRestoredSession] = useState(null);
+  const [user, setUser] = useState(null); // Supabase auth user (null = anonymous)
+
+  // Listen for Supabase auth state changes (optional — only when configured)
+  useEffect(() => {
+    if (!supabase) return;
+
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setUser(session?.user ?? null);
+    });
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      (_event, session) => setUser(session?.user ?? null)
+    );
+
+    return () => subscription.unsubscribe();
+  }, []);
 
   // Load session on mount
   useEffect(() => {
@@ -129,6 +147,14 @@ export default function App() {
     }
   }, []);
 
+  const handleViewHistory = useCallback(() => {
+    setScreen('history');
+  }, []);
+
+  const handleBackFromHistory = useCallback(() => {
+    setScreen('landing');
+  }, []);
+
   if (isLoading) {
     return (
       <SafeAreaView style={styles.container}>
@@ -146,6 +172,8 @@ export default function App() {
           onCreateSession={handleCreateSession}
           onJoinSession={handleJoinSession}
           onRejoinAsOrganizer={handleRejoinAsOrganizer}
+          onViewHistory={handleViewHistory}
+          user={user}
         />
       )}
       {screen === 'organizer' && (
@@ -154,6 +182,7 @@ export default function App() {
           onLeave={handleLeaveSession}
           onSessionUpdate={handleSessionUpdate}
           initialData={restoredSession}
+          user={user}
         />
       )}
       {screen === 'player' && (
@@ -161,6 +190,14 @@ export default function App() {
           onCreateSession={handleCreateSession}
           onJoinSession={handleJoinSession}
           onRejoinAsOrganizer={handleRejoinAsOrganizer}
+          onViewHistory={handleViewHistory}
+          user={user}
+        />
+      )}
+      {screen === 'history' && (
+        <MatchHistoryScreen
+          onBack={handleBackFromHistory}
+          user={user}
         />
       )}
     </SafeAreaView>

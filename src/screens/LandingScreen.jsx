@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
   StyleSheet,
   Text,
@@ -8,13 +8,15 @@ import {
   KeyboardAvoidingView,
   Platform,
   ScrollView,
+  Image,
 } from 'react-native';
 import { useResponsive, colors, spacing } from '../utils/responsive';
-import { loadOrganizerHistory, removeOrganizerSession } from '../utils/storage';
+import { loadOrganizerHistory, removeOrganizerSession, uploadAvatar, getAvatarUrl } from '../utils/storage';
+import { supabase } from '../utils/supabase';
 
-export default function LandingScreen({ onCreateSession, onJoinSession, onRejoinAsOrganizer }) {
+export default function LandingScreen({ onCreateSession, onJoinSession, onRejoinAsOrganizer, onViewHistory, user }) {
   const { isDesktop } = useResponsive();
-  const [mode, setMode] = useState(null); // 'create' | 'join' | null
+  const [mode, setMode] = useState(null); // 'create' | 'join' | 'auth' | null
   const [joinTab, setJoinTab] = useState('players'); // 'players' | 'organizers'
   const [sessionCode, setSessionCode] = useState('');
   const [name, setName] = useState('');
@@ -22,6 +24,48 @@ export default function LandingScreen({ onCreateSession, onJoinSession, onRejoin
   const [error, setError] = useState('');
   const [organizerHistory, setOrganizerHistory] = useState([]);
   const [organizerCode, setOrganizerCode] = useState('');
+
+  // Auth form state
+  const [authTab, setAuthTab] = useState('login'); // 'login' | 'signup'
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authDisplayName, setAuthDisplayName] = useState('');
+  const [authLoading, setAuthLoading] = useState(false);
+
+  // Avatar state
+  const [avatarUrl, setAvatarUrl] = useState(null);
+  const [avatarLoading, setAvatarLoading] = useState(false);
+  const fileInputRef = useRef(null);
+
+  // Load avatar when user changes
+  useEffect(() => {
+    if (user && supabase) {
+      getAvatarUrl().then(setAvatarUrl);
+    } else {
+      setAvatarUrl(null);
+    }
+  }, [user]);
+
+  const handleAvatarPress = () => {
+    if (fileInputRef.current) {
+      fileInputRef.current.click();
+    }
+  };
+
+  const handleFileSelected = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    if (file.size > 1024 * 1024) {
+      setError('Image must be under 1MB');
+      return;
+    }
+    setAvatarLoading(true);
+    const url = await uploadAvatar(file);
+    if (url) {
+      setAvatarUrl(url);
+    }
+    setAvatarLoading(false);
+  };
 
   // Load organizer history when entering join mode
   useEffect(() => {
@@ -87,6 +131,58 @@ export default function LandingScreen({ onCreateSession, onJoinSession, onRejoin
     handleRejoinOrganizer(organizerCode);
   };
 
+  const handleLogin = async () => {
+    if (!authEmail.trim() || !authPassword) {
+      setError('Please enter email and password');
+      return;
+    }
+    setAuthLoading(true);
+    setError('');
+    const { error: authError } = await supabase.auth.signInWithPassword({
+      email: authEmail.trim(),
+      password: authPassword,
+    });
+    setAuthLoading(false);
+    if (authError) {
+      setError(authError.message);
+    } else {
+      setMode(null);
+      setAuthEmail('');
+      setAuthPassword('');
+    }
+  };
+
+  const handleSignUp = async () => {
+    if (!authEmail.trim() || !authPassword) {
+      setError('Please enter email and password');
+      return;
+    }
+    if (!authDisplayName.trim()) {
+      setError('Please enter your display name');
+      return;
+    }
+    setAuthLoading(true);
+    setError('');
+    const { error: authError } = await supabase.auth.signUp({
+      email: authEmail.trim(),
+      password: authPassword,
+      options: { data: { display_name: authDisplayName.trim() } },
+    });
+    setAuthLoading(false);
+    if (authError) {
+      setError(authError.message);
+    } else {
+      setMode(null);
+      setAuthEmail('');
+      setAuthPassword('');
+      setAuthDisplayName('');
+    }
+  };
+
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+  };
+
   const getTimeRemaining = (expiresAt) => {
     const remaining = expiresAt - Date.now();
     if (remaining <= 0) return 'Expired';
@@ -112,6 +208,42 @@ export default function LandingScreen({ onCreateSession, onJoinSession, onRejoin
           </Text>
         </View>
 
+        {/* Auth Status (shown only when logged in) */}
+        {supabase && user && (
+          <View style={styles.authStatus}>
+            <View style={styles.authLoggedIn}>
+              <TouchableOpacity onPress={handleAvatarPress} activeOpacity={0.7}>
+                {avatarUrl ? (
+                  <Image source={{ uri: avatarUrl }} style={styles.avatar} />
+                ) : (
+                  <View style={[styles.avatar, styles.avatarPlaceholder]}>
+                    <Text style={styles.avatarPlaceholderText}>
+                      {(user.user_metadata?.display_name || user.email || '?')[0].toUpperCase()}
+                    </Text>
+                  </View>
+                )}
+              </TouchableOpacity>
+              <View>
+                <Text style={styles.authUserText}>
+                  {user.user_metadata?.display_name || user.email}
+                </Text>
+                <TouchableOpacity onPress={handleLogout} activeOpacity={0.7}>
+                  <Text style={styles.authLinkText}>Sign out</Text>
+                </TouchableOpacity>
+              </View>
+              {Platform.OS === 'web' && (
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="image/jpeg,image/png,image/webp"
+                  style={{ display: 'none' }}
+                  onChange={handleFileSelected}
+                />
+              )}
+            </View>
+          </View>
+        )}
+
         {/* Card Container */}
         <View style={[styles.card, isDesktop && styles.cardDesktop]}>
           {!mode && (
@@ -131,6 +263,26 @@ export default function LandingScreen({ onCreateSession, onJoinSession, onRejoin
               >
                 <Text style={styles.secondaryButtonText}>Join Session</Text>
               </TouchableOpacity>
+
+              {supabase && !user && (
+                <TouchableOpacity
+                  style={[styles.authButton, isDesktop && styles.buttonDesktop]}
+                  onPress={() => setMode('auth')}
+                  activeOpacity={0.8}
+                >
+                  <Text style={styles.authButtonText}>Sign In / Create Account</Text>
+                </TouchableOpacity>
+              )}
+
+              {user && onViewHistory && (
+                <TouchableOpacity
+                  style={[styles.historyButton, isDesktop && styles.buttonDesktop]}
+                  onPress={onViewHistory}
+                  activeOpacity={0.8}
+                >
+                  <Text style={styles.historyButtonText}>Match History</Text>
+                </TouchableOpacity>
+              )}
             </View>
           )}
 
@@ -300,6 +452,78 @@ export default function LandingScreen({ onCreateSession, onJoinSession, onRejoin
                   {error ? <Text style={styles.error}>{error}</Text> : null}
                 </>
               )}
+
+              <TouchableOpacity style={styles.backButton} onPress={resetToHome}>
+                <Text style={styles.backButtonText}>← Back</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+
+          {mode === 'auth' && supabase && (
+            <View style={styles.form}>
+              <View style={styles.tabRow}>
+                <TouchableOpacity
+                  style={[styles.tab, authTab === 'login' && styles.tabActive]}
+                  onPress={() => { setAuthTab('login'); setError(''); }}
+                  activeOpacity={0.8}
+                >
+                  <Text style={[styles.tabText, authTab === 'login' && styles.tabTextActive]}>
+                    Log In
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.tab, authTab === 'signup' && styles.tabActive]}
+                  onPress={() => { setAuthTab('signup'); setError(''); }}
+                  activeOpacity={0.8}
+                >
+                  <Text style={[styles.tabText, authTab === 'signup' && styles.tabTextActive]}>
+                    Sign Up
+                  </Text>
+                </TouchableOpacity>
+              </View>
+
+              {authTab === 'signup' && (
+                <TextInput
+                  style={[styles.input, isDesktop && styles.inputDesktop]}
+                  placeholder="Display Name"
+                  placeholderTextColor="#999"
+                  value={authDisplayName}
+                  onChangeText={setAuthDisplayName}
+                  autoCapitalize="words"
+                />
+              )}
+
+              <TextInput
+                style={[styles.input, isDesktop && styles.inputDesktop]}
+                placeholder="Email"
+                placeholderTextColor="#999"
+                value={authEmail}
+                onChangeText={setAuthEmail}
+                keyboardType="email-address"
+                autoCapitalize="none"
+              />
+
+              <TextInput
+                style={[styles.input, isDesktop && styles.inputDesktop]}
+                placeholder="Password"
+                placeholderTextColor="#999"
+                value={authPassword}
+                onChangeText={setAuthPassword}
+                secureTextEntry
+              />
+
+              {error ? <Text style={styles.error}>{error}</Text> : null}
+
+              <TouchableOpacity
+                style={[styles.primaryButton, isDesktop && styles.buttonDesktop, authLoading && styles.buttonDisabled]}
+                onPress={authTab === 'login' ? handleLogin : handleSignUp}
+                activeOpacity={0.8}
+                disabled={authLoading}
+              >
+                <Text style={styles.primaryButtonText}>
+                  {authLoading ? 'Please wait...' : authTab === 'login' ? 'Log In' : 'Create Account'}
+                </Text>
+              </TouchableOpacity>
 
               <TouchableOpacity style={styles.backButton} onPress={resetToHome}>
                 <Text style={styles.backButtonText}>← Back</Text>
@@ -676,6 +900,90 @@ const styles = StyleSheet.create({
       web: {
         userSelect: 'none',
       },
+    }),
+  },
+  authStatus: {
+    marginBottom: spacing.md,
+    alignItems: 'center',
+  },
+  authLoggedIn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.md,
+  },
+  authUserText: {
+    fontSize: 14,
+    color: colors.textSecondary,
+  },
+  authLinkText: {
+    fontSize: 14,
+    color: colors.primary,
+    fontWeight: '500',
+    ...Platform.select({
+      web: { cursor: 'pointer' },
+    }),
+  },
+  buttonDisabled: {
+    opacity: 0.6,
+  },
+  avatar: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    marginRight: spacing.sm,
+  },
+  avatarPlaceholder: {
+    backgroundColor: colors.primary,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  avatarPlaceholderText: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: '600',
+  },
+  authButton: {
+    backgroundColor: 'transparent',
+    paddingVertical: 14,
+    paddingHorizontal: 32,
+    borderRadius: 14,
+    alignItems: 'center',
+    borderWidth: 2,
+    borderColor: colors.primary,
+    ...Platform.select({
+      web: {
+        cursor: 'pointer',
+        transition: 'all 0.15s ease',
+      },
+    }),
+  },
+  authButtonText: {
+    color: colors.primary,
+    fontSize: 16,
+    fontWeight: '600',
+    ...Platform.select({
+      web: { userSelect: 'none' },
+    }),
+  },
+  historyButton: {
+    backgroundColor: colors.primaryLight,
+    paddingVertical: 14,
+    paddingHorizontal: 32,
+    borderRadius: 14,
+    alignItems: 'center',
+    ...Platform.select({
+      web: {
+        cursor: 'pointer',
+        transition: 'all 0.15s ease',
+      },
+    }),
+  },
+  historyButtonText: {
+    color: colors.primary,
+    fontSize: 16,
+    fontWeight: '600',
+    ...Platform.select({
+      web: { userSelect: 'none' },
     }),
   },
 });
